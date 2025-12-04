@@ -39,8 +39,8 @@ class ContrastiveHead(BaseModule):
 
         super().__init__(init_cfg=init_cfg)
 
-        self.bias = nn.Parameter(torch.zeros([]))
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.bias = nn.Parameter(torch.zeros([]), requires_grad=False)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07), requires_grad=False)
         self.use_einsum = use_einsum
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
@@ -80,9 +80,9 @@ class BNContrastiveHead(BaseModule):
 
         super().__init__(init_cfg=init_cfg)
         self.norm = build_norm_layer(norm_cfg, embed_dims)[1]
-        self.bias = nn.Parameter(torch.zeros([]))
+        self.bias = nn.Parameter(torch.zeros([]), requires_grad=False)
         # use -1.0 is more stable
-        self.logit_scale = nn.Parameter(-1.0 * torch.ones([]))
+        self.logit_scale = nn.Parameter(-1.0 * torch.ones([]), requires_grad=False)
         self.use_einsum = use_einsum
 
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
@@ -361,8 +361,8 @@ class YOLOWorldHead(YOLOv8Head):
 
         outs = self(img_feats, txt_feats, txt_masks)
         # Fast version
-        loss_inputs = outs + (batch_data_samples['bboxes_labels'],
-                              batch_data_samples['img_metas'])
+        
+        loss_inputs = outs + (None, batch_data_samples['bboxes_labels'],batch_data_samples['img_metas'])
         losses = self.loss_by_feat(*loss_inputs)
 
         return losses

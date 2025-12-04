@@ -58,7 +58,210 @@ class YOLOWorldDetector(YOLODetector):
     def reparameterize(self, texts: List[List[str]]) -> None:
         # encode text embeddings into the detector
         self.texts = texts
-        self.text_feats, None = self.backbone.forward_text(texts)
+        self.text_feats, _ = self.backbone.forward_text(texts)
+
+    def _forward(
+            self,
+            batch_inputs: Tensor,
+            batch_data_samples: OptSampleList = None) -> Tuple[List[Tensor]]:
+        """Network forward process. Usually includes backbone, neck and head
+        forward without any post-processing.
+        """
+        img_feats, txt_feats, txt_masks = self.extract_feat(
+            batch_inputs, batch_data_samples)
+        results = self.bbox_head.forward(img_feats, txt_feats, txt_masks)
+        return results
+
+    def extract_feat(
+            self, batch_inputs: Tensor,
+            batch_data_samples: SampleList) -> Tuple[Tuple[Tensor], Tensor]:
+        """Extract features."""
+        txt_feats = None
+        if batch_data_samples is None:
+            texts = self.texts
+            txt_feats = self.text_feats
+        elif isinstance(batch_data_samples,
+                        dict) and 'texts' in batch_data_samples:
+            texts = batch_data_samples['texts']
+        elif isinstance(batch_data_samples, list) and hasattr(
+                batch_data_samples[0], 'texts'):
+            texts = [data_sample.texts for data_sample in batch_data_samples]
+        elif hasattr(self, 'text_feats'):
+            texts = self.texts
+            txt_feats = self.text_feats
+        else:
+            raise TypeError('batch_data_samples should be dict or list.')
+        if txt_feats is not None:
+            # forward image only
+            img_feats = self.backbone.forward_image(batch_inputs)
+        else:
+            img_feats, (txt_feats,
+                        txt_masks) = self.backbone(batch_inputs, texts)
+        if self.with_neck:
+            if self.mm_neck:
+                img_feats = self.neck(img_feats, txt_feats)
+            else:
+                img_feats = self.neck(img_feats)
+        return img_feats, txt_feats, txt_masks
+
+import transformers
+import re
+from llava.constants import IGNORE_INDEX
+@MODELS.register_module()
+class YOLLMDetector(YOLODetector):
+    """Implementation of YOLOW Series"""
+    def __init__(self,
+                 *args,
+                 mm_neck: bool = False,
+                 num_train_classes=80,
+                 num_test_classes=80,
+                 lmm=None,
+                 lmm_max_token_length=512,
+                 **kwargs) -> None:
+        self.mm_neck = mm_neck
+        self.num_train_classes = num_train_classes
+        self.num_test_classes = num_test_classes
+        super().__init__(*args, **kwargs)
+        self.lmm_max_token_length = lmm_max_token_length
+        if lmm is not None:
+            from llava.model.language_model.llava_qwen import LlavaQwenForCausalLM
+            from llava.model.multimodal_projector.builder import vision_projector_with_pos_proj
+            
+            self.lmm = LlavaQwenForCausalLM.from_pretrained(lmm).half()
+            # self.lmm = checkpoint_wrapper(self.lmm)
+            self.lmm.requires_grad_(False)
+            self.lmm.config.use_cache = False
+            
+            self.lmm_tokenizer = transformers.AutoTokenizer.from_pretrained(
+                lmm,
+                cache_dir=None, 
+                model_max_length=self.lmm_max_token_length, 
+                padding_side="right")
+            if hasattr(self.lmm.model, 'mm_projector'):
+                del self.lmm.model.mm_projector
+            if hasattr(self.lmm.model, 'vision_tower'):
+                del self.lmm.model.vision_tower
+            
+            self.lmm.config.tokenizer_padding_side = self.lmm_tokenizer.padding_side
+            self.lmm.config.tokenizer_model_max_length = self.lmm_max_token_length
+
+            mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', 'mlp2x_gelu')
+            if mlp_gelu_match:
+                mlp_depth = int(mlp_gelu_match.group(1))
+                modules = [nn.Linear(256, self.lmm.config.hidden_size)]
+                for _ in range(1, mlp_depth):
+                    modules.append(nn.GELU())
+                    modules.append(nn.Linear(self.lmm.config.hidden_size, self.lmm.config.hidden_size))
+                vision_projector = nn.Sequential(*modules)
+
+            vision_projector = vision_projector_with_pos_proj(self.lmm.config.hidden_size, [vision_projector])
+            
+            
+            self.connector = vision_projector
+
+            yv, xv = torch.meshgrid([torch.range(0, 1, 1/self.feature_map_size), torch.range(0, 1, 1/self.feature_map_size)])
+            grid = torch.stack((xv, yv), 2).view(self.feature_map_size+1, self.feature_map_size+1, 2)
+            self.grid_box = torch.cat([grid[:-1, :-1], grid[1:, 1:]], dim=-1).flatten(0, 1)
+
+
+    def loss(self, batch_inputs: Tensor,
+             batch_data_samples: SampleList) -> Union[dict, list]:
+        """Calculate losses from a batch of inputs and data samples."""
+        self.bbox_head.num_classes = self.num_train_classes
+        img_feats, txt_feats, txt_masks = self.extract_feat(
+            batch_inputs, batch_data_samples)
+        
+        losses = self.bbox_head.loss(img_feats, txt_feats, txt_masks,
+                                     batch_data_samples)
+        if self.lmm is not None:
+            breakpoint()
+            input_ids = [
+                torch.tensor(data_samples.conversations['input_id'], dtype=torch.long, device=img_feats.device) for data_samples in batch_data_samples
+            ]
+            labels = [
+                torch.tensor(data_samples.conversations['label'], dtype=torch.long, device=img_feats.device) for data_samples in batch_data_samples
+            ]
+            if self.use_constrast_conv:
+                constrast_input_ids = [
+                    torch.tensor(data_samples.contrast_conv[1]['input_id'], dtype=torch.long, device=img_feats.device) for data_samples in batch_data_samples if 'contrast_conv' in data_samples
+                ]
+                constrast_labels = [
+                    torch.tensor(data_samples.contrast_conv[1]['label'], dtype=torch.long, device=img_feats.device) for data_samples in batch_data_samples if 'contrast_conv' in data_samples
+                ]
+                input_ids += constrast_input_ids
+                labels += constrast_labels
+            if self.lmm_tokenizer.pad_token_id is None:
+                self.lmm_tokenizer.pad_token_id = 0 
+            input_ids = torch.nn.utils.rnn.pad_sequence(
+                input_ids,
+                batch_first=True,
+                padding_value=self.lmm_tokenizer.pad_token_id)
+            labels = torch.nn.utils.rnn.pad_sequence(labels,
+                                                        batch_first=True,
+                                                        padding_value=IGNORE_INDEX)
+            input_ids = input_ids[:, :self.lmm_max_token_length]
+            labels = labels[:, :self.lmm_max_token_length]
+            attention_mask=input_ids.ne(self.lmm_tokenizer.pad_token_id)
+            lmm_imput_dict = dict(
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+            )
+
+            image_queries = []
+            dummies = []
+            query_masks = []
+                                
+            for i in range(len(decoder_inputs_dict['memory'])):
+                p5_feature_map = decoder_inputs_dict['memory'][i][decoder_inputs_dict['level_start_index'][-2]: decoder_inputs_dict['level_start_index'][-1]]
+                k = self.k_mapper(p5_feature_map)
+                v = self.v_mapper(p5_feature_map)
+                p5_feature_map  = self.qformer(self.qformer_queries.permute(1,0,2), k.unsqueeze(1), v.unsqueeze(1))[0]
+                p5_feature_map = p5_feature_map.squeeze(1)
+                image_queries.append(p5_feature_map.half())
+                query_masks.append(torch.ones((len(image_queries[-1])), device=p5_feature_map.device, dtype=torch.bool))
+
+            
+            lmm_imput_dict['input_ids'] = lmm_imput_dict['input_ids'].to(decoder_inputs_dict['memory'].device)
+            lmm_imput_dict['labels'] = lmm_imput_dict['labels'].to(decoder_inputs_dict['memory'].device)
+            lmm_imput_dict['attention_mask'] = lmm_imput_dict['attention_mask'].to(decoder_inputs_dict['memory'].device)
+            lmm_imput_dict['image_queries'] = image_queries
+            lmm_imput_dict['query_masks'] = query_masks
+            
+            self.lmm.eval() 
+            with torch.autocast('cuda', enabled=True):
+                loss_lmm = self.lmm.detection_forward(**lmm_imput_dict)
+            losses['loss_lmm_image'] = loss_lmm.loss * self.lmm_image_loss_weight + 0*sum(dummies)
+        
+        return losses
+
+    def predict(self,
+                batch_inputs: Tensor,
+                batch_data_samples: SampleList,
+                rescale: bool = True) -> SampleList:
+        """Predict results from a batch of inputs and data samples with post-
+        processing.
+        """
+
+        img_feats, txt_feats, txt_masks = self.extract_feat(
+            batch_inputs, batch_data_samples)
+
+        # self.bbox_head.num_classes = self.num_test_classes
+        self.bbox_head.num_classes = txt_feats[0].shape[0]
+        results_list = self.bbox_head.predict(img_feats,
+                                              txt_feats,
+                                              txt_masks,
+                                              batch_data_samples,
+                                              rescale=rescale)
+
+        batch_data_samples = self.add_pred_to_datasample(
+            batch_data_samples, results_list)
+        return batch_data_samples
+
+    def reparameterize(self, texts: List[List[str]]) -> None:
+        # encode text embeddings into the detector
+        self.texts = texts
+        self.text_feats = self.backbone.forward_text(texts)
 
     def _forward(
             self,

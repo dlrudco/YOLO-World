@@ -196,12 +196,148 @@ class BaseMultiModalMixImageTransform(BaseTransform, metaclass=ABCMeta):
         # Mosaic or MixUp
         results = self.mix_img_transform(results)
 
+        results = self._update_label_conv(results)
+
         if 'mix_results' in results:
             results.pop('mix_results')
         results['dataset'] = dataset
 
         return results
 
+    def _update_label_conv(self, results):
+        if isinstance(self.transform.__self__, MultiModalMosaic):
+            image_first = results['conversation'][0]['value'].split('\n')[0] == '<image>'
+            base_human = ''
+            base_gpt = ''
+            loc_strs = ('top_left', 'top_right', 'bottom_left', 'bottom_right')
+            for i, loc in enumerate(loc_strs):
+                if loc == 'top_left':
+                    results_patch = results
+                else:
+                    results_patch = results['mix_results'][i - 1]
+                if len(results_patch['conversation']) == 0:
+                    print(f'Warning: no conversation found for {loc} part of the image.')
+                    continue
+                try:
+                    patch_conv_human = [r for r in results_patch['conversation'][0]['value'].split('\n') if r != '<image>'][0]
+                    human_text = f"For the {loc.replace('_', ' ')} part of the image, {patch_conv_human[0].lower()}{patch_conv_human[1:]}"
+                    patch_conv_gpt = results_patch['conversation'][1]['value']
+                    gpt_text = f"For the {loc.replace('_', ' ')} part of the image, {patch_conv_gpt[0].lower()}{patch_conv_gpt[1:]}"
+                    base_human += human_text + '\n'
+                    base_gpt += gpt_text + '\n'
+                except KeyError:
+                    breakpoint()
+
+            if image_first:
+                base_human = '<image>\n' + base_human.strip() # remove last \n
+            else:
+                base_human = base_human.strip() + '<image>'
+            results['conversation'] = [{'from': 'human', 'value': base_human}, {'from': 'gpt', 'value': base_gpt.strip()}] # remove last \n
+        return results
+
+from transformers import AutoTokenizer
+@TRANSFORMS.register_module()
+class LMMTransform(BaseTransform):
+
+    def __init__(self,
+                 tokenizer_name,
+                 lmm_max_token_length=512):
+        if AutoTokenizer is None:
+            raise RuntimeError(
+                'transformers is not installed, please install it by: '
+                'pip install transformers.')
+
+        self.lmm_tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                cache_dir=None, 
+                model_max_length=lmm_max_token_length, 
+                padding_side="right")
+
+        from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
+        self.IGNORE_INDEX = IGNORE_INDEX
+        self.IMAGE_TOKEN_INDEX = IMAGE_TOKEN_INDEX
+        # roles = {"human": "<|im_start|>user", "gpt": "<|im_start|>assistant"}
+        self.roles = {"human": "user", "gpt": "assistant"}
+
+        # Add image tokens to tokenizer as a special tokens
+        # When there is actually an image, we add the image tokens as a special token
+        self.lmm_tokenizer.add_tokens(["<image>"], special_tokens=True)
+
+        self.image_token_index = self.lmm_tokenizer.convert_tokens_to_ids("<image>")
+        im_start, im_end = self.lmm_tokenizer.additional_special_tokens_ids
+        # unmask_tokens = ["<|im_start|>", "<|im_start|>", "\n"]
+        self.unmask_tokens_idx =  [198, im_start, im_end]
+
+        # Reset Qwen chat templates so that it won't include system message every time we apply
+        chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+        self.lmm_tokenizer.chat_template = chat_template
+
+        self.image_level_input_id = None
+        self.image_level_target = None
+
+
+    def get_LMM_input(self, type, source):
+
+        input_id, target = [], []
+
+        if self.image_level_input_id is not None:
+            input_id = copy.deepcopy(self.image_level_input_id)
+            target = copy.deepcopy(self.image_level_target)
+        else:
+            # Build system message for each sentence
+            input_id += self.lmm_tokenizer.apply_chat_template([{"role" : "system", "content" : "You are a helpful assistant."}])
+            target += [self.IGNORE_INDEX] * len(input_id)
+
+            conv = source[0]
+            role = conv["from"]
+            content = conv["value"]
+
+            role =  self.roles.get(role, role)
+            
+            conv = [{"role" : role, "content" : content}]
+            encode_id = self.lmm_tokenizer.apply_chat_template(conv)
+            input_id += encode_id
+            target += [self.IGNORE_INDEX] * len(encode_id)
+
+            for idx, encode_id in enumerate(input_id):
+                if encode_id in self.unmask_tokens_idx:
+                    target[idx] = encode_id
+                if encode_id == self.image_token_index:
+                    input_id[idx] = self.IMAGE_TOKEN_INDEX
+            
+            self.image_level_input_id = copy.deepcopy(input_id)
+            self.image_level_target = copy.deepcopy(target)
+
+        
+        conv = source[1]
+        role = conv["from"]
+        content = conv["value"]
+
+        role =  self.roles.get(role, role)
+        
+        conv = [{"role" : role, "content" : content}]
+        encode_ids = self.lmm_tokenizer.apply_chat_template(conv)
+        sub_target = copy.deepcopy(encode_ids)
+
+        for idx, encode_id in enumerate(encode_ids):
+            if encode_id in self.unmask_tokens_idx:
+                sub_target[idx] = encode_id
+            if encode_id == self.image_token_index:
+                encode_ids[idx] = self.IMAGE_TOKEN_INDEX
+        
+        input_id += encode_ids
+        target += sub_target
+        
+        return dict(
+            input_id=input_id,
+            label=target,
+        )
+        
+    def transform(self, results: dict) -> dict:
+        ori_conv = copy.deepcopy(results['conversation'])
+        results['conversation'] = self.get_LMM_input('image', results['conversation'])
+        results['ori_conv'] = ori_conv
+        return results
 
 @TRANSFORMS.register_module()
 class MultiModalMosaic(BaseMultiModalMixImageTransform):

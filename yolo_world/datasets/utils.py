@@ -49,6 +49,11 @@ def yolow_collate(data_batch: Sequence,
     if hasattr(data_batch[0]['data_samples'], 'texts'):
         batch_texts = [meta['data_samples'].texts for meta in data_batch]
         collated_results['data_samples']['texts'] = batch_texts
+        
+    if hasattr(data_batch[0]['data_samples'], 'conversation'):
+        batch_convs = [meta['data_samples'].conversation for meta in data_batch]
+        collated_results['data_samples']['conversation'] = batch_convs
+
 
     if hasattr(data_batch[0]['data_samples'], 'is_detection'):
         # detection flag

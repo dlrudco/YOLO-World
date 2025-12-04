@@ -20,7 +20,7 @@ neck_embed_channels = [128, 256, _base_.last_stage_out_channels // 2]
 neck_num_heads = [4, 8, _base_.last_stage_out_channels // 2 // 32]
 base_lr = 2e-4
 weight_decay = 0.05
-train_batch_size_per_gpu = 16
+train_batch_size_per_gpu = 4
 load_from = 'weights/yolo_world_v2_m_obj365v1_goldg_pretrain-c6237d5b.pth'
 # text_model_name = '../pretrained_models/clip-vit-base-patch32-projection'
 text_model_name = 'openai/clip-vit-base-patch32'
@@ -32,7 +32,7 @@ model = dict(
     mm_neck=True,
     num_train_classes=num_training_classes,
     num_test_classes=num_classes,
-    lmm=None,
+    lmm=lmm_path,
     lmm_max_token_length=lmm_max_token_length,
     data_preprocessor=dict(type='YOLOWDetDataPreprocessor'),
     backbone=dict(
@@ -62,9 +62,12 @@ text_transform = [
          max_num_samples=num_training_classes,
          padding_to_max=True,
          padding_value=''),
+    dict(type='LMMTransform',
+         tokenizer_name=lmm_path,
+         lmm_max_token_length=lmm_max_token_length),
     dict(type='mmdet.PackDetInputs',
          meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'flip',
-                    'flip_direction', 'texts'))
+                    'flip_direction', 'texts', 'conversation'))
 ]
 mosaic_affine_transform = [
     dict(
@@ -103,7 +106,7 @@ train_pipeline_stage2 = [
 ]
 coco_train_dataset = dict(
     _delete_=True,
-    type='MultiModalDataset',
+    type='MultiModalConverstaionDataset',
     dataset=dict(
         type='YOLOv5CocoDataset',
         data_root='data/coco',
@@ -111,9 +114,11 @@ coco_train_dataset = dict(
         data_prefix=dict(img='train2017/'),
         filter_cfg=dict(filter_empty_gt=False, min_size=32)),
     class_text_path='data/texts/coco_class_texts.json',
+    conversation_text_path='data/coco/annotations/instances_train2017_vg_merged6.jsonl',
     pipeline=train_pipeline)
 
 train_dataloader = dict(
+    num_workers=0,
     persistent_workers=persistent_workers,
     batch_size=train_batch_size_per_gpu,
     collate_fn=dict(type='yolow_collate'),
@@ -175,6 +180,7 @@ optim_wrapper = dict(
         weight_decay=weight_decay,
         batch_size_per_gpu=train_batch_size_per_gpu),
     paramwise_cfg=dict(
+        bypass_duplicate=True,
         custom_keys={'backbone.text_model': dict(lr_mult=0.01),
                      'logit_scale': dict(weight_decay=0.0)}),
     constructor='YOLOWv5OptimizerConstructor')

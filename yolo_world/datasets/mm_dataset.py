@@ -89,7 +89,101 @@ class MultiModalDataset:
     def __len__(self) -> int:
         return self._ori_len
 
+@DATASETS.register_module()
+class MultiModalConverstaionDataset:
+    """Multi-modal dataset."""
 
+    def __init__(self,
+                 dataset: Union[BaseDataset, dict],
+                 class_text_path: str = None,
+                 conversation_text_path : str=None,
+                 test_mode: bool = True,
+                 pipeline: List[Union[dict, Callable]] = [],
+                 lazy_init: bool = False) -> None:
+        self.dataset: BaseDataset
+        if isinstance(dataset, dict):
+            self.dataset = DATASETS.build(dataset)
+        elif isinstance(dataset, BaseDataset):
+            self.dataset = dataset
+        else:
+            raise TypeError(
+                'dataset must be a dict or a BaseDataset, '
+                f'but got {dataset}')
+
+        if conversation_text_path is not None:
+            self.conversation_text_path = conversation_text_path
+            self.load_conversations(self.conversation_text_path)
+
+        if class_text_path is not None:
+            self.class_texts = json.load(open(class_text_path, 'r'))
+            # ori_classes = self.dataset.metainfo['classes']
+            # assert len(ori_classes) == len(self.class_texts), \
+            #     ('The number of classes in the dataset and the class text'
+            #      'file must be the same.')
+        else:
+            self.class_texts = None
+
+        self.test_mode = test_mode
+        self._metainfo = self.dataset.metainfo
+        self.pipeline = Compose(pipeline)
+
+        self._fully_initialized = False
+        if not lazy_init:
+            self.full_init()
+
+    def load_conversations(self, conversation_text_path):
+        with open(conversation_text_path, 'r') as f:
+            data_list = [json.loads(line) for line in f]
+        self.conversations = {d['filename']: d['conversations'] for d in data_list}
+
+    @property
+    def metainfo(self) -> dict:
+        return copy.deepcopy(self._metainfo)
+
+    def full_init(self) -> None:
+        """``full_init`` dataset."""
+        if self._fully_initialized:
+            return
+
+        self.dataset.full_init()
+        self._ori_len = len(self.dataset)
+        self._fully_initialized = True
+        
+
+    @force_full_init
+    def get_data_info(self, idx: int) -> dict:
+        """Get annotation by index."""
+        data_info = self.dataset.get_data_info(idx)
+        if self.class_texts is not None:
+            data_info.update({'texts': self.class_texts})
+        if self.conversations is not None:
+            try:
+                data_info.update({'conversation': self.conversations[data_info['img_path'].split('/')[-1]]})
+            except KeyError:
+                data_info.update({'conversation': []})
+        return data_info
+
+    def __getitem__(self, idx):
+        if not self._fully_initialized:
+            print_log(
+                'Please call `full_init` method manually to '
+                'accelerate the speed.',
+                logger='current',
+                level=logging.WARNING)
+            self.full_init()
+
+        data_info = self.get_data_info(idx)
+
+        if hasattr(self.dataset, 'test_mode') and not self.dataset.test_mode:
+            data_info['dataset'] = self
+        elif not self.test_mode:
+            data_info['dataset'] = self
+        return self.pipeline(data_info)
+
+    @force_full_init
+    def __len__(self) -> int:
+        return self._ori_len
+    
 @DATASETS.register_module()
 class MultiModalMixedDataset(MultiModalDataset):
     """Multi-modal Mixed dataset.
